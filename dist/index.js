@@ -13,117 +13,119 @@
     pii: { hashText: false, stripValues: true },
     targetOrigin: "*"
   };
-  const VT_READY = { type: "vt-init", frameURL: location.href };
-  const elToKey = /* @__PURE__ */ new WeakMap();
-  const keyToEl = /* @__PURE__ */ new Map();
-  function getKey(el) {
-    let k = elToKey.get(el);
-    if (!k) {
-      k = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
-      elToKey.set(el, k);
-      keyToEl.set(k, el);
-    }
-    return k;
-  }
-  safePost(VT_READY);
+  post({ type: "vt-init", frameURL: location.href });
   window.addEventListener("message", (e) => {
     const data = e.data;
-    if (data?.type === "vt-config") {
+    if (data?.type === "vt-config" && typeof data.cfg === "object") {
       cfg = { ...cfg, ...data.cfg };
-      attachEventListeners();
+      attach();
+    }
+    if (data?.type === "vt-rebuild") {
+      rebuildSelector(data);
     }
   });
-  window.addEventListener("message", (e) => {
-    if (e.data?.type === "vt-rebuild") {
-      const { elementKey, selectorCfg } = e.data;
-      const el = keyToEl.get(elementKey);
-      if (!el) return safePost({ type: "vt-rebuild-response", elementKey, error: "not-found" });
-      const info = buildSelector(el, selectorCfg);
-      safePost({ type: "vt-rebuild-response", elementKey, selector: info.selector, recipe: info.recipe });
-    }
-  });
-  function attachEventListeners() {
-    cfg.events.forEach(
-      (evt) => document.addEventListener(evt, handleDomEvent, true)
-    );
+  function attach() {
+    cfg.events.forEach((t) => window.addEventListener(t, handle, true));
   }
-  function handleDomEvent(ev) {
+  function handle(ev) {
     const el = ev.target;
-    if (!el || el.nodeType !== 1) return;
+    if (!el || !(el instanceof Element)) return;
     const selectorInfo = buildSelector(el, cfg.selector);
     const bbox = el.getBoundingClientRect();
-    const meta = collectMeta(el, cfg.pii);
-    const payload = {
+    const message = {
       type: "vt-event",
       eventType: ev.type,
       selector: selectorInfo.selector,
       recipe: selectorInfo.recipe,
-      meta,
-      bbox: {
-        x: bbox.x,
-        y: bbox.y,
-        w: bbox.width,
-        h: bbox.height
-      },
+      elementPath: pathToRoot(el),
+      meta: collectMeta(el, cfg.pii),
+      bbox: { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height },
       timestamp: Date.now(),
       frameURL: location.href
     };
-    const elementKey = getKey(el);
-    safePost(payload);
+    post(message);
+  }
+  async function rebuildSelector({ eventId, elementPath, newPrefs }) {
+    const el = locate(elementPath);
+    if (!el) {
+      return post({ type: "vt-rebuild-result", eventId, error: "not-found" });
+    }
+    const selectorInfo = buildSelector(el, newPrefs);
+    const matches = document.querySelectorAll(selectorInfo.selector).length;
+    post({
+      type: "vt-rebuild-result",
+      eventId,
+      selector: selectorInfo.selector,
+      recipe: selectorInfo.recipe,
+      matchCount: matches
+    });
   }
   function buildSelector(el, opts) {
     const path = [];
     const recipe = [];
     let depth = 0;
-    while (el && el.nodeType === 1 && depth < opts.maxDepth) {
-      let sel = "";
-      if (opts.useId && el.id) {
-        sel = `#${cssEscape(el.id)}`;
+    let node = el;
+    while (node && node.nodeType === 1 && depth < opts.maxDepth) {
+      let seg = "";
+      if (opts.useId && node.id) {
+        seg = "#" + css(node.id);
         recipe.push("id");
-        path.unshift(sel);
+        path.unshift(seg);
         break;
       }
       if (opts.useTag) {
-        sel += el.tagName.toLowerCase();
+        seg += node.tagName.toLowerCase();
         recipe.push("tag");
       }
-      if (opts.useClasses && el.classList.length > 0) {
-        sel += "." + Array.from(el.classList).map(cssEscape).join(".");
+      if (opts.useClasses && node.classList.length) {
+        seg += "." + Array.from(node.classList).map(css).join(".");
         recipe.push("classes");
       }
-      if (opts.useNthChild && el.parentElement) {
-        const idx = Array.prototype.indexOf.call(el.parentElement.children, el) + 1;
-        sel += `:nth-child(${idx})`;
+      if (opts.useNthChild && node.parentElement) {
+        const idx = Array.from(node.parentElement.children).indexOf(node) + 1;
+        seg += `:nth-child(${idx})`;
         recipe.push("nth");
       }
-      path.unshift(sel);
-      el = el.parentElement;
+      path.unshift(seg);
+      node = node.parentElement;
       depth++;
     }
     return { selector: path.join(" > "), recipe };
   }
-  function collectMeta(el, piiCfg) {
-    const attr = (name) => el.getAttribute(name);
-    const textContent = el.textContent?.trim() || "";
-    const textPromise = piiCfg.hashText ? sha256(textContent).then((hash) => hash.slice(0, 8)) : Promise.resolve(textContent.slice(0, 200));
+  const css = (s) => s.replace(/([ #;?%&,.+*~':"!^$[\]()=>|/@])/g, "\\$1");
+  function pathToRoot(el) {
+    const p = [];
+    let n = el;
+    while (n && n.parentElement) {
+      p.unshift(Array.from(n.parentElement.children).indexOf(n));
+      n = n.parentElement;
+    }
+    return p;
+  }
+  function locate(path) {
+    let n = document.documentElement;
+    for (const idx of path) {
+      if (!n || !n.children[idx]) return null;
+      n = n.children[idx];
+    }
+    return n;
+  }
+  function collectMeta(el, pii) {
+    const t = (el.textContent || "").trim();
+    const input = el;
     return {
-      href: attr("href"),
-      src: attr("src"),
-      value: piiCfg.stripValues ? null : attr("value"),
-      dataset: { ...el.dataset },
-      text: textContent
+      href: el.getAttribute("href") || null,
+      src: el.getAttribute("src") || null,
+      value: pii.stripValues ? null : input.value || el.getAttribute("value"),
+      dataset: el instanceof HTMLElement ? { ...el.dataset } : {},
+      text: pii.hashText ? "" : t.slice(0, 200)
     };
   }
-  function cssEscape(id) {
-    return id.replace(/([ #;?%&,.+*~':"!^$\[\]()=>|/@])/g, "\\$1");
-  }
-  function sha256(str) {
-    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(str)).then((buf) => Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join(""));
-  }
-  function safePost(msg) {
+  function post(msg) {
     try {
       window.parent.postMessage(msg, cfg.targetOrigin);
-    } catch (_) {
+    } catch (e) {
+      console.error("postMessage error", e);
     }
   }
 })();

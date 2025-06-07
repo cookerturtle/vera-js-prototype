@@ -1,199 +1,194 @@
+/* eslint-disable no-console */
 (function VisualTagger() {
-    type SelectorOptions = {
+    interface SelectorConfig {
         useTag: boolean;
         useId: boolean;
         useClasses: boolean;
         useNthChild: boolean;
         useDataAttrs: boolean;
         maxDepth: number;
-    };
+    }
 
-    type PiiOptions = {
+    interface PiiConfig {
         hashText: boolean;
         stripValues: boolean;
-    };
+    }
 
-    type Config = {
-        selector: SelectorOptions;
+    interface Config {
+        selector: SelectorConfig;
         events: string[];
-        pii: PiiOptions;
+        pii: PiiConfig;
         targetOrigin: string;
-    };
+    }
 
-    type VtInitMessage = {
-        type: 'vt-init';
-        frameURL: string;
-    };
+    interface SelectorInfo {
+        selector: string;
+        recipe: string[];
+    }
 
-    type VtConfigMessage = {
-        type: 'vt-config';
-        cfg: Partial<Config>;
-    };
-
-    type VtEventMessage = {
-        type: 'vt-event';
+    interface VTEvent {
+        type: string;
         eventType: string;
         selector: string;
         recipe: string[];
-        meta: Record<string, any>;
+        elementPath: number[];
+        meta: ReturnType<typeof collectMeta>;
         bbox: { x: number; y: number; w: number; h: number };
         timestamp: number;
         frameURL: string;
-    };
+    }
+
+    interface VTRebuildMessage {
+        type: 'vt-rebuild';
+        eventId: string;
+        elementPath: number[];
+        newPrefs: SelectorConfig;
+    }
 
     let cfg: Config = {
         selector: {
-            useTag: true,
-            useId: true,
-            useClasses: true,
-            useNthChild: true,
-            useDataAttrs: false,
-            maxDepth: 8
+            useTag: true, useId: true, useClasses: true, useNthChild: true,
+            useDataAttrs: false, maxDepth: 8
         },
         events: ['click'],
         pii: { hashText: false, stripValues: true },
         targetOrigin: '*'
     };
 
-    const VT_READY: VtInitMessage = { type: 'vt-init', frameURL: location.href };
-    const elToKey = new WeakMap();
-    const keyToEl = new Map();
-
-    function getKey(el) {
-        let k = elToKey.get(el);
-        if (!k) {
-            k = (crypto.randomUUID?.() || Math.random().toString(36).slice(2));
-            elToKey.set(el, k);
-            keyToEl.set(k, el);
-        }
-        return k;
-    }
-
-    safePost(VT_READY);
+    post({ type: 'vt-init', frameURL: location.href });
 
     window.addEventListener('message', (e: MessageEvent) => {
-        const data = e.data as VtConfigMessage;
-        if (data?.type === 'vt-config') {
+        const data = e.data;
+        if (data?.type === 'vt-config' && typeof data.cfg === 'object') {
             cfg = { ...cfg, ...data.cfg };
-            attachEventListeners();
+            attach();
+        }
+        if (data?.type === 'vt-rebuild') {
+            rebuildSelector(data as VTRebuildMessage);
         }
     });
 
-    window.addEventListener('message', e => {
-        if (e.data?.type === 'vt-rebuild') {
-            const { elementKey, selectorCfg } = e.data;
-            const el = keyToEl.get(elementKey);
-            if (!el) return safePost({ type: 'vt-rebuild-response', elementKey, error: 'not-found' });
-            const info = buildSelector(el, selectorCfg);
-            safePost({ type: 'vt-rebuild-response', elementKey, selector: info.selector, recipe: info.recipe });
-        }
-    });
-
-    function attachEventListeners(): void {
-        cfg.events.forEach(evt =>
-            document.addEventListener(evt, handleDomEvent as EventListener, true)
-        );
+    function attach(): void {
+        cfg.events.forEach(t => window.addEventListener(t, handle, true));
     }
 
-    function handleDomEvent(ev: Event): void {
+    function handle(ev: Event): void {
         const el = ev.target as HTMLElement;
-        if (!el || el.nodeType !== 1) return;
+        if (!el || !(el instanceof Element)) return;
 
         const selectorInfo = buildSelector(el, cfg.selector);
         const bbox = el.getBoundingClientRect();
-        const meta = collectMeta(el, cfg.pii);
 
-        const payload: VtEventMessage = {
+        const message: VTEvent = {
             type: 'vt-event',
             eventType: ev.type,
             selector: selectorInfo.selector,
             recipe: selectorInfo.recipe,
-            meta,
-            bbox: {
-                x: bbox.x,
-                y: bbox.y,
-                w: bbox.width,
-                h: bbox.height
-            },
+            elementPath: pathToRoot(el),
+            meta: collectMeta(el, cfg.pii),
+            bbox: { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height },
             timestamp: Date.now(),
             frameURL: location.href
         };
 
-        const elementKey = getKey(el);
-        safePost(payload);
+        post(message);
     }
 
-    function buildSelector(el: HTMLElement, opts: SelectorOptions): { selector: string; recipe: string[] } {
+    async function rebuildSelector({ eventId, elementPath, newPrefs }: VTRebuildMessage): Promise<void> {
+        const el = locate(elementPath);
+        if (!el) {
+            return post({ type: 'vt-rebuild-result', eventId, error: 'not-found' });
+        }
+
+        const selectorInfo = buildSelector(el, newPrefs);
+        const matches = document.querySelectorAll(selectorInfo.selector).length;
+
+        post({
+            type: 'vt-rebuild-result',
+            eventId,
+            selector: selectorInfo.selector,
+            recipe: selectorInfo.recipe,
+            matchCount: matches
+        });
+    }
+
+    function buildSelector(el: Element, opts: SelectorConfig): SelectorInfo {
         const path: string[] = [];
         const recipe: string[] = [];
         let depth = 0;
+        let node: Element | null = el;
 
-        while (el && el.nodeType === 1 && depth < opts.maxDepth) {
-            let sel = '';
-
-            if (opts.useId && el.id) {
-                sel = `#${cssEscape(el.id)}`;
+        while (node && node.nodeType === 1 && depth < opts.maxDepth) {
+            let seg = '';
+            if (opts.useId && node.id) {
+                seg = '#' + css(node.id);
                 recipe.push('id');
-                path.unshift(sel);
+                path.unshift(seg);
                 break;
             }
-
             if (opts.useTag) {
-                sel += el.tagName.toLowerCase();
+                seg += node.tagName.toLowerCase();
                 recipe.push('tag');
             }
-
-            if (opts.useClasses && el.classList.length > 0) {
-                sel += '.' + Array.from(el.classList).map(cssEscape).join('.');
+            if (opts.useClasses && node.classList.length) {
+                seg += '.' + Array.from(node.classList).map(css).join('.');
                 recipe.push('classes');
             }
-
-            if (opts.useNthChild && el.parentElement) {
-                const idx = Array.prototype.indexOf.call(el.parentElement.children, el) + 1;
-                sel += `:nth-child(${idx})`;
+            if (opts.useNthChild && node.parentElement) {
+                const idx = Array.from(node.parentElement.children).indexOf(node) + 1;
+                seg += `:nth-child(${idx})`;
                 recipe.push('nth');
             }
 
-            path.unshift(sel);
-            el = el.parentElement as HTMLElement;
+            path.unshift(seg);
+            node = node.parentElement;
             depth++;
         }
 
         return { selector: path.join(' > '), recipe };
     }
 
-    function collectMeta(el: HTMLElement, piiCfg: PiiOptions): Record<string, any> {
-        const attr = (name: string): string | null => el.getAttribute(name);
+    const css = (s: string): string => s.replace(/([ #;?%&,.+*~':"!^$[\]()=>|/@])/g, '\\$1');
 
-        const textContent = el.textContent?.trim() || '';
-        const textPromise = piiCfg.hashText
-            ? sha256(textContent).then(hash => hash.slice(0, 8))
-            : Promise.resolve(textContent.slice(0, 200));
+    function pathToRoot(el: Element): number[] {
+        const p: number[] = [];
+        let n: Element | null = el;
+
+        while (n && n.parentElement) {
+            p.unshift(Array.from(n.parentElement.children).indexOf(n));
+            n = n.parentElement;
+        }
+
+        return p;
+    }
+
+    function locate(path: number[]): Element | null {
+        let n: Element | null = document.documentElement;
+        for (const idx of path) {
+            if (!n || !n.children[idx]) return null;
+            n = n.children[idx] as Element;
+        }
+        return n;
+    }
+
+    function collectMeta(el: Element, pii: PiiConfig) {
+        const t = (el.textContent || '').trim();
+        const input = el as HTMLInputElement;
 
         return {
-            href: attr('href'),
-            src: attr('src'),
-            value: piiCfg.stripValues ? null : attr('value'),
-            dataset: { ...el.dataset },
-            text: textContent
+            href: el.getAttribute('href') || null,
+            src: el.getAttribute('src') || null,
+            value: pii.stripValues ? null : input.value || el.getAttribute('value'),
+            dataset: el instanceof HTMLElement ? { ...el.dataset } : {},
+            text: pii.hashText ? '' : t.slice(0, 200)
         };
     }
 
-    function cssEscape(id: string): string {
-        return id.replace(/([ #;?%&,.+*~':"!^$\[\]()=>|/@])/g, '\\$1');
-    }
-
-    function sha256(str: string): Promise<string> {
-        return crypto.subtle.digest('SHA-256', new TextEncoder().encode(str))
-            .then(buf => Array.from(new Uint8Array(buf))
-                .map(b => b.toString(16).padStart(2, '0')).join(''));
-    }
-
-    function safePost(msg: object): void {
+    function post(msg: any): void {
         try {
             window.parent.postMessage(msg, cfg.targetOrigin);
-        } catch (_) {
-            // Ignore postMessage errors
+        } catch (e) {
+            console.error('postMessage error', e);
         }
     }
 })();
