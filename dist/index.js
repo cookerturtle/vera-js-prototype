@@ -14,12 +14,32 @@
     targetOrigin: "*"
   };
   const VT_READY = { type: "vt-init", frameURL: location.href };
+  const elToKey = /* @__PURE__ */ new WeakMap();
+  const keyToEl = /* @__PURE__ */ new Map();
+  function getKey(el) {
+    let k = elToKey.get(el);
+    if (!k) {
+      k = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
+      elToKey.set(el, k);
+      keyToEl.set(k, el);
+    }
+    return k;
+  }
   safePost(VT_READY);
   window.addEventListener("message", (e) => {
     const data = e.data;
     if (data?.type === "vt-config") {
       cfg = { ...cfg, ...data.cfg };
       attachEventListeners();
+    }
+  });
+  window.addEventListener("message", (e) => {
+    if (e.data?.type === "vt-rebuild") {
+      const { elementKey, selectorCfg } = e.data;
+      const el = keyToEl.get(elementKey);
+      if (!el) return safePost({ type: "vt-rebuild-response", elementKey, error: "not-found" });
+      const info = buildSelector(el, selectorCfg);
+      safePost({ type: "vt-rebuild-response", elementKey, selector: info.selector, recipe: info.recipe });
     }
   });
   function attachEventListeners() {
@@ -48,6 +68,7 @@
       timestamp: Date.now(),
       frameURL: location.href
     };
+    const elementKey = getKey(el);
     safePost(payload);
   }
   function buildSelector(el, opts) {
